@@ -1,0 +1,44 @@
+[package]
+name = "sentinel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core engine of Sentinel: TSDB, SLO evaluator, anomaly detection, AI hooks"
+
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+ahash = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }
+ordered-float = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+rand_distr = { workspace = true }
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[dev-dependencies.criterion]
+workspace = true
+
+[features]
+default = []

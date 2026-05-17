@@ -1,0 +1,33 @@
+# Sentinel example configuration.
+#
+# Run with:
+#   cargo run -p sentinel-cli --release -- serve --config examples/sentinel.example.yaml
+
+listen: "127.0.0.1:9090"
+wal_path: "/tmp/sentinel.wal"
+retention_minutes: 1440
+eval_interval_secs: 10
+
+slos:
+  - name: gpt4o-availability
+    model: gpt-4o
+    sli:
+      kind: success_ratio
+    objective: 0.999
+    window: 30d
+
+  - name: gpt4o-latency-p95-500ms
+    model: gpt-4o
+    sli:
+      kind: latency_threshold
+      threshold_ms: 500.0
+      quantile: 0.95
+    objective: 0.99
+    window: 7d
+
+  - name: embed3-availability
+    model: text-embedding-3
+    sli:
+      kind: success_ratio
+    objective: 0.995
+    window: 7d
