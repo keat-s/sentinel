@@ -195,3 +195,99 @@ fn make_event(
         metadata: Default::default(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(0xC0FFEE)
+    }
+
+    fn sample(scenario: Scenario, elapsed: f64, total: f64, n: usize) -> Vec<InferenceEvent> {
+        let mut rng = rng();
+        (0..n)
+            .map(|_| make_event("m", "v1", &scenario, elapsed, total, &mut rng))
+            .collect()
+    }
+
+    fn server_failure_rate(events: &[InferenceEvent]) -> f64 {
+        let bad = events.iter().filter(|e| e.status.is_server_failure()).count();
+        bad as f64 / events.len() as f64
+    }
+
+    fn mean_latency(events: &[InferenceEvent]) -> f64 {
+        events.iter().map(|e| e.latency_ms).sum::<f64>() / events.len() as f64
+    }
+
+    #[test]
+    fn events_are_well_formed() {
+        for ev in sample(Scenario::Baseline, 0.0, 60.0, 100) {
+            assert_eq!(ev.model, "m");
+            assert_eq!(ev.model_version, "v1");
+            assert!(ev.latency_ms > 0.0);
+            assert!(ev.input_tokens.unwrap() >= 50);
+            assert!(ev.output_tokens.is_some());
+            assert!(ev.cost_usd.unwrap() > 0.0);
+        }
+    }
+
+    #[test]
+    fn baseline_has_low_error_rate() {
+        let events = sample(Scenario::Baseline, 30.0, 60.0, 5000);
+        let rate = server_failure_rate(&events);
+        assert!(rate < 0.01, "baseline server-failure rate too high: {rate}");
+    }
+
+    #[test]
+    fn burst_spikes_errors_only_inside_window() {
+        // Burst window is 20%..40% of the run.
+        let inside = sample(Scenario::Burst, 18.0, 60.0, 5000); // 30% through
+        let outside = sample(Scenario::Burst, 36.0, 60.0, 5000); // 60% through
+
+        let inside_rate = server_failure_rate(&inside);
+        let outside_rate = server_failure_rate(&outside);
+        assert!(
+            inside_rate > 0.2,
+            "expected elevated errors inside burst, got {inside_rate}"
+        );
+        assert!(
+            outside_rate < 0.01,
+            "expected baseline errors outside burst, got {outside_rate}"
+        );
+    }
+
+    #[test]
+    fn drift_scales_latency_over_the_run() {
+        let start = mean_latency(&sample(Scenario::Drift, 0.0, 60.0, 5000));
+        let end = mean_latency(&sample(Scenario::Drift, 60.0, 60.0, 5000));
+        // Multiplier ramps 1.0 → 3.0; allow statistical slack.
+        let ratio = end / start;
+        assert!(
+            ratio > 2.0 && ratio < 4.0,
+            "expected ~3x latency at end of drift, got {ratio:.2}x"
+        );
+    }
+
+    #[test]
+    fn tail_latency_produces_rare_slow_calls() {
+        let events = sample(Scenario::TailLatency, 30.0, 60.0, 20_000);
+        let mean = mean_latency(&events);
+        // ~1% of calls are 10x slower; they exist but stay rare.
+        let slow = events.iter().filter(|e| e.latency_ms > mean * 5.0).count();
+        let frac = slow as f64 / events.len() as f64;
+        assert!(frac > 0.001, "expected a slow tail, got {frac}");
+        assert!(frac < 0.05, "tail should be rare, got {frac}");
+    }
+
+    #[test]
+    fn zero_total_duration_does_not_panic() {
+        // Guards the `total_secs.max(1.0)` divide-by-zero protection.
+        let mut r = rng();
+        let _ = make_event("m", "v1", &Scenario::Burst, 0.0, 0.0, &mut r);
+        let _ = make_event("m", "v1", &Scenario::Drift, 5.0, 0.0, &mut r);
+    }
+}

@@ -417,6 +417,128 @@ mod tests {
     }
 
     #[test]
+    fn max_series_cap_drops_new_series_but_keeps_existing() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(0)));
+        let db = Tsdb::with_clock(60, clock).with_max_series(2);
+
+        assert!(db.ingest(&ev("a", Status::Success, 10.0, 0)));
+        assert!(db.ingest(&ev("b", Status::Success, 10.0, 0)));
+        // Third distinct series exceeds the cap and is dropped.
+        assert!(!db.ingest(&ev("c", Status::Success, 10.0, 0)));
+        assert_eq!(db.series_count(), 2);
+
+        // Existing series keep ingesting normally.
+        assert!(db.ingest(&ev("a", Status::Success, 10.0, 1)));
+        let r = db.query("a", 60 * 60 * SECOND, 0.5).unwrap();
+        assert_eq!(r.total, 2);
+        // Dropped series is unknown to queries.
+        assert!(db.query("c", 60 * 60 * SECOND, 0.5).is_none());
+    }
+
+    #[test]
+    fn out_of_order_ingest_lands_in_sorted_chunks() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(0)));
+        let db = Tsdb::with_clock(60, clock);
+
+        // Minutes arrive as 5, 3, 5, 1, 4 — exercising the out-of-order
+        // insert path (new chunk in the middle, update of an existing
+        // mid-chunk, and insert before the front).
+        for minute in [5u64, 3, 5, 1, 4] {
+            db.ingest(&ev("m", Status::Success, 10.0, minute * 60));
+        }
+
+        let entry = db.series.iter().next().unwrap();
+        let s = entry.value().read();
+        let minutes: Vec<u64> = s.chunks.iter().map(|c| c.minute).collect();
+        assert_eq!(minutes, vec![1, 3, 4, 5], "chunks must stay sorted");
+        let totals: Vec<u64> = s.chunks.iter().map(Chunk::total).collect();
+        assert_eq!(totals, vec![1, 1, 1, 2], "duplicate minute merges into one chunk");
+        drop(s);
+
+        let r = db.query("m", 60 * 60 * SECOND, 0.5).unwrap();
+        assert_eq!(r.total, 5, "no events lost to reordering");
+    }
+
+    #[test]
+    fn query_latency_above_counts_slow_tail() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(60 * SECOND)));
+        let db = Tsdb::with_clock(60, clock);
+
+        // 500 fast (10ms) + 500 slow (1000ms) events.
+        for i in 0..1000u64 {
+            let latency = if i % 2 == 0 { 10.0 } else { 1000.0 };
+            db.ingest(&ev("m", Status::Success, latency, 60));
+        }
+
+        let r = db.query_latency_above("m", 60 * 60 * SECOND, 500.0).unwrap();
+        assert_eq!(r.total, 1000);
+        let above = r.count_above as f64;
+        assert!(
+            (above - 500.0).abs() < 50.0,
+            "expected ~500 above threshold, got {above}"
+        );
+
+        // Threshold above everything ⇒ ~0; threshold below everything ⇒ ~all.
+        let none = db.query_latency_above("m", 60 * 60 * SECOND, 5000.0).unwrap();
+        assert!(none.count_above < 50, "got {}", none.count_above);
+        let all = db.query_latency_above("m", 60 * 60 * SECOND, 1.0).unwrap();
+        assert!(all.count_above > 950, "got {}", all.count_above);
+
+        // Unknown model ⇒ None.
+        assert!(db.query_latency_above("nope", 60 * SECOND, 100.0).is_none());
+    }
+
+    #[test]
+    fn snapshot_all_covers_every_series() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(60 * SECOND)));
+        let db = Tsdb::with_clock(60, clock);
+        db.ingest(&ev("alpha", Status::Success, 10.0, 60));
+        db.ingest(&ev("alpha", Status::ServerError, 10.0, 60));
+        db.ingest(&ev("beta", Status::Success, 10.0, 60));
+
+        let mut snaps = db.snapshot_all(60 * 60 * SECOND, 0.5);
+        snaps.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].0, "alpha");
+        assert_eq!(snaps[0].1.total, 2);
+        assert_eq!(snaps[0].1.good, 1);
+        assert_eq!(snaps[1].0, "beta");
+        assert_eq!(snaps[1].1.total, 1);
+    }
+
+    #[test]
+    fn model_version_cardinality_tracks_distinct_versions() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(60 * SECOND)));
+        let db = Tsdb::with_clock(60, clock);
+        for i in 0..100u64 {
+            let mut e = ev("m", Status::Success, 10.0, 60);
+            // Two versions in play — a rollout in progress.
+            e.model_version = if i % 2 == 0 { "v1".into() } else { "v2".into() };
+            db.ingest(&e);
+        }
+        let r = db.query("m", 60 * 60 * SECOND, 0.5).unwrap();
+        assert_eq!(
+            r.model_version_cardinality, 2,
+            "HLL should resolve two distinct versions exactly at this scale"
+        );
+    }
+
+    #[test]
+    fn metadata_labels_create_distinct_series_found_by_model_fallback() {
+        let clock = Arc::new(MockClock::starting_at(TimestampNanos(60 * SECOND)));
+        let db = Tsdb::with_clock(60, clock);
+        let mut e = ev("m", Status::Success, 10.0, 60);
+        e.metadata.insert("region".into(), "us-east-1".into());
+        db.ingest(&e);
+
+        // No bare `model=m` series exists; query must fall back to scanning
+        // for a series whose model label matches.
+        let r = db.query("m", 60 * 60 * SECOND, 0.5);
+        assert!(r.is_some(), "fallback lookup by model label failed");
+        assert_eq!(r.unwrap().total, 1);
+    }
+
+    #[test]
     fn retention_evicts_old_minutes() {
         let clock = Arc::new(MockClock::starting_at(TimestampNanos(0)));
         let db = Tsdb::with_clock(3, clock.clone());

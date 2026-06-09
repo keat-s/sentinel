@@ -291,6 +291,167 @@ mod tests {
         );
     }
 
+    /// Ingest `n` events at `ts_secs` whose latency is `slow_ms` for one in
+    /// every `slow_every` events and `fast_ms` otherwise. All succeed.
+    fn ingest_latencies(db: &Tsdb, n: u64, fast_ms: f64, slow_ms: f64, slow_every: u64, ts_secs: u64) {
+        for i in 0..n {
+            let latency_ms = if slow_every > 0 && i % slow_every == 0 {
+                slow_ms
+            } else {
+                fast_ms
+            };
+            let ev = InferenceEvent {
+                timestamp: TimestampNanos(ts_secs.saturating_mul(SECOND).saturating_add(i)),
+                model: "m".into(),
+                model_version: "v1".into(),
+                latency_ms,
+                status: Status::Success,
+                input_tokens: None,
+                output_tokens: None,
+                cost_usd: None,
+                metadata: Default::default(),
+            };
+            db.ingest(&ev);
+        }
+    }
+
+    fn latency_slo(objective: f64, threshold_ms: f64) -> SloConfig {
+        SloConfig {
+            name: "p95-latency".into(),
+            model: "m".into(),
+            sli: Sli::LatencyThreshold {
+                quantile: 0.95,
+                threshold_ms,
+            },
+            objective,
+            window: SloWindow("30d".into()),
+        }
+    }
+
+    #[test]
+    fn latency_threshold_sli_fires_on_slow_tail() {
+        let (clock, db) = make_db();
+        // Half of all events are 10x slower than the 200ms threshold, against
+        // a 0.99 objective ⇒ burn ≈ 50x, well above every tier.
+        for minute in 0..70 {
+            ingest_latencies(&db, 1000, 50.0, 2000.0, 2, minute * 60);
+        }
+        clock.advance(70 * MINUTE);
+
+        let eval = MwmbrEvaluator::new(vec![latency_slo(0.99, 200.0)]);
+        let result = eval.evaluate(&db);
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].alerts.iter().any(|a| a.severity == AlertSeverity::Page),
+            "expected a Page alert from the latency SLI, got {:?}",
+            result[0].alerts
+        );
+        assert!(
+            result[0].burn_rate_1h > 14.4,
+            "expected fast burn, got {}",
+            result[0].burn_rate_1h
+        );
+    }
+
+    #[test]
+    fn latency_threshold_sli_quiet_when_under_threshold() {
+        let (clock, db) = make_db();
+        // Everything is far below the threshold ⇒ zero bad events.
+        for minute in 0..70 {
+            ingest_latencies(&db, 1000, 50.0, 50.0, 0, minute * 60);
+        }
+        clock.advance(70 * MINUTE);
+
+        let eval = MwmbrEvaluator::new(vec![latency_slo(0.99, 500.0)]);
+        let result = eval.evaluate(&db);
+        assert!(
+            result[0].alerts.is_empty(),
+            "no alerts expected when all latencies are below threshold, got {:?}",
+            result[0].alerts
+        );
+    }
+
+    #[test]
+    fn latency_threshold_sli_for_unknown_model_is_quiet() {
+        let (_clock, db) = make_db();
+        let mut slo = latency_slo(0.99, 200.0);
+        slo.model = "does-not-exist".into();
+        let eval = MwmbrEvaluator::new(vec![slo]);
+        let result = eval.evaluate(&db);
+        assert!(result[0].alerts.is_empty());
+        assert_eq!(result[0].burn_rate_1h, 0.0);
+    }
+
+    #[test]
+    fn moderate_sustained_burn_fires_ticket_not_page() {
+        let (clock, db) = make_db();
+        // 2.5% failure against a 0.99 objective ⇒ burn 2.5x: above the
+        // slow-burn 1x tier, below moderate (6x) and fast (14.4x) tiers.
+        for minute in 0..70 {
+            ingest_window(&db, 1000, 40, minute * 60);
+        }
+        clock.advance(70 * MINUTE);
+
+        let slo = SloConfig {
+            name: "avail".into(),
+            model: "m".into(),
+            sli: Sli::SuccessRatio,
+            objective: 0.99,
+            window: SloWindow("30d".into()),
+        };
+        let eval = MwmbrEvaluator::new(vec![slo]);
+        let result = eval.evaluate(&db);
+        let severities: Vec<_> = result[0].alerts.iter().map(|a| a.severity).collect();
+        assert!(
+            severities.contains(&AlertSeverity::Ticket),
+            "expected a Ticket alert at 2.5x burn, got {:?}",
+            result[0].alerts
+        );
+        assert!(
+            !severities.contains(&AlertSeverity::Page),
+            "2.5x burn must not page, got {:?}",
+            result[0].alerts
+        );
+    }
+
+    #[test]
+    fn evaluation_reports_budget_diagnostics() {
+        let (clock, db) = make_db();
+        // 2% failure against 0.99 ⇒ full-window burn 2.0, budget fully
+        // consumed twice over ⇒ remaining = 1 - 2.0 = -1.0.
+        for minute in 0..70 {
+            ingest_window(&db, 1000, 50, minute * 60);
+        }
+        clock.advance(70 * MINUTE);
+
+        let slo = SloConfig {
+            name: "avail".into(),
+            model: "m".into(),
+            sli: Sli::SuccessRatio,
+            objective: 0.99,
+            window: SloWindow("30d".into()),
+        };
+        let eval = MwmbrEvaluator::new(vec![slo]);
+        let result = eval.evaluate(&db);
+        let e = &result[0];
+        assert!((e.objective - 0.99).abs() < 1e-9);
+        assert!(
+            (e.burn_rate_full_window - 2.0).abs() < 0.1,
+            "expected ~2.0 full-window burn, got {}",
+            e.burn_rate_full_window
+        );
+        assert!(
+            (e.budget_remaining - (-1.0)).abs() < 0.2,
+            "expected ~-1.0 budget remaining, got {}",
+            e.budget_remaining
+        );
+        // Alert diagnostics carry the event totals they were computed from.
+        for a in &e.alerts {
+            assert!(a.long_total > 0);
+            assert!(a.short_total > 0);
+        }
+    }
+
     #[test]
     fn short_window_clears_after_recovery() {
         let (clock, db) = make_db();

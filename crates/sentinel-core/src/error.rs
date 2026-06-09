@@ -61,3 +61,45 @@ impl From<reqwest::Error> for SentinelError {
         SentinelError::Llm(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_messages_carry_context() {
+        let e = SentinelError::WalCorruption {
+            offset: 128,
+            detail: "bad crc".into(),
+        };
+        assert_eq!(e.to_string(), "wal corruption at offset 128: bad crc");
+
+        let e = SentinelError::UnknownMetric("latency_p99".into());
+        assert_eq!(e.to_string(), "slo refers to unknown metric: latency_p99");
+
+        let e = SentinelError::Llm("http 500".into());
+        assert_eq!(e.to_string(), "llm request failed: http 500");
+
+        let e = SentinelError::Invariant("chunks sorted");
+        assert_eq!(e.to_string(), "invariant violated: chunks sorted");
+    }
+
+    #[test]
+    fn io_errors_convert_and_preserve_message() {
+        let io = io::Error::new(io::ErrorKind::NotFound, "missing wal");
+        let e = SentinelError::from(io);
+        assert!(matches!(e, SentinelError::Io(_)));
+        assert!(e.to_string().contains("missing wal"));
+    }
+
+    #[test]
+    fn serde_errors_convert_to_serde_variant() {
+        let json_err = serde_json::from_str::<u64>("not json").unwrap_err();
+        let e = SentinelError::from(json_err);
+        assert!(matches!(e, SentinelError::Serde(_)));
+
+        let yaml_err = serde_yaml::from_str::<u64>("[unclosed").unwrap_err();
+        let e = SentinelError::from(yaml_err);
+        assert!(matches!(e, SentinelError::Serde(_)));
+    }
+}

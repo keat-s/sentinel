@@ -356,3 +356,288 @@ fn parse_duration(s: &str) -> Option<u64> {
     };
     n.checked_mul(mul)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use sentinel_core::ingest::Status;
+    use sentinel_core::time::TimestampNanos;
+    use sentinel_core::tsdb::Tsdb;
+    use tower::ServiceExt;
+
+    // --- parse_duration ----------------------------------------------------
+
+    #[test]
+    fn parse_duration_accepts_all_units() {
+        assert_eq!(parse_duration("30s"), Some(30 * SECOND));
+        assert_eq!(parse_duration("5m"), Some(5 * 60 * SECOND));
+        assert_eq!(parse_duration("6h"), Some(6 * 3600 * SECOND));
+        assert_eq!(parse_duration("3d"), Some(3 * 86400 * SECOND));
+    }
+
+    #[test]
+    fn parse_duration_trims_whitespace() {
+        assert_eq!(parse_duration("  1h "), Some(3600 * SECOND));
+    }
+
+    #[test]
+    fn parse_duration_rejects_invalid_input() {
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("5"), None, "missing unit");
+        assert_eq!(parse_duration("h"), None, "missing number");
+        assert_eq!(parse_duration("5x"), None, "unknown unit");
+        assert_eq!(parse_duration("-5m"), None, "negative");
+        assert_eq!(parse_duration("1.5h"), None, "fractional");
+        assert_eq!(parse_duration("5 m"), None, "inner whitespace");
+    }
+
+    #[test]
+    fn parse_duration_rejects_overflow_instead_of_wrapping() {
+        let huge = format!("{}d", u64::MAX);
+        assert_eq!(parse_duration(&huge), None);
+        // Largest value that fits stays accepted.
+        assert!(parse_duration("1d").is_some());
+    }
+
+    // --- HTTP handlers (in-process, no socket) ------------------------------
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            tsdb: Arc::new(Tsdb::new(60 * 24)),
+            evaluator: Arc::new(RwLock::new(MwmbrEvaluator::new(Vec::new()))),
+            last_evaluation: Arc::new(RwLock::new(Vec::new())),
+            anomalies: Arc::new(RwLock::new(VecDeque::new())),
+            detectors: Arc::new(DetectorRegistry::new()),
+            summarizer: Arc::new(NoopSummarizer),
+            wal: None,
+        })
+    }
+
+    fn event_json(model: &str, status: Status, latency_ms: f64) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": TimestampNanos::now(),
+            "model": model,
+            "model_version": "v1",
+            "latency_ms": latency_ms,
+            "status": status,
+        })
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_ok() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/v1/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ingest_then_query_roundtrip() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        for i in 0..10 {
+            let status = if i == 0 { Status::ServerError } else { Status::Success };
+            let req = Request::post("/v1/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(event_json("gpt-4o", status, 100.0).to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/query?model=gpt-4o&window=1h&quantile=0.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 10);
+        assert_eq!(json["good"], 9);
+        assert_eq!(json["server_failures"], 1);
+    }
+
+    #[tokio::test]
+    async fn query_with_invalid_window_is_bad_request() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/v1/query?model=m&window=fortnight")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_unknown_model_is_not_found() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::get("/v1/query?model=missing&window=1h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn batch_ingest_accepts_and_counts() {
+        let app = build_router(test_state());
+        let batch: Vec<_> = (0..5)
+            .map(|_| event_json("m", Status::Success, 50.0))
+            .collect();
+        let resp = app
+            .oneshot(
+                Request::post("/v1/ingest/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&batch).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let json = body_json(resp).await;
+        assert_eq!(json["ingested"], 5);
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_is_rejected() {
+        let app = build_router(test_state());
+        let batch: Vec<_> = (0..MAX_BATCH_SIZE + 1)
+            .map(|_| event_json("m", Status::Success, 1.0))
+            .collect();
+        let resp = app
+            .oneshot(
+                Request::post("/v1/ingest/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&batch).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_by_limit_layer() {
+        let app = build_router(test_state());
+        let big = vec![b'x'; MAX_INGEST_BODY_BYTES + 1];
+        let resp = app
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn malformed_ingest_json_is_client_error() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/v1/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn anomalies_endpoint_returns_empty_ring() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(Request::get("/v1/anomalies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn summarize_uses_fallback_summarizer() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/v1/incidents/summarize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "DB outage",
+                            "notes": ["replica lag spiked"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let summary = json["summary"].as_str().unwrap();
+        assert!(summary.contains("DB outage"));
+        assert!(summary.contains("replica lag spiked"));
+    }
+
+    #[tokio::test]
+    async fn ingest_feeds_registered_anomaly_detectors() {
+        use sentinel_core::anomaly::ZScoreDetector;
+        use sentinel_core::tsdb::SeriesKey;
+
+        let state = test_state();
+        let series = SeriesKey::new("inference", [("model", "m")]).id();
+        state
+            .detectors
+            .register(series, ZScoreDetector::new(series, 0.1, 3.0, 30));
+        let app = build_router(state.clone());
+
+        // Flat baseline, then one large spike.
+        for i in 0..100 {
+            let latency = if i == 99 { 10_000.0 } else { 50.0 + (i % 3) as f64 };
+            let req = Request::post("/v1/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(event_json("m", Status::Success, latency).to_string()))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+
+        let resp = app
+            .oneshot(Request::get("/v1/anomalies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json = body_json(resp).await;
+        let list = json.as_array().unwrap();
+        assert!(!list.is_empty(), "the latency spike should be in the ring");
+        assert_eq!(list[0]["source"], "zscore");
+    }
+}

@@ -77,3 +77,50 @@ impl Chunk {
         self.server_error + self.timeout
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_chunk_is_empty() {
+        let c = Chunk::new(42);
+        assert_eq!(c.minute, 42);
+        assert_eq!(c.total(), 0);
+        assert_eq!(c.good(), 0);
+        assert_eq!(c.server_failures(), 0);
+        assert!(c.latency.is_empty());
+    }
+
+    #[test]
+    fn record_routes_each_status_to_its_counter() {
+        let mut c = Chunk::new(0);
+        c.record(Status::Success, 10.0);
+        c.record(Status::Success, 20.0);
+        c.record(Status::ClientError, 30.0);
+        c.record(Status::ServerError, 40.0);
+        c.record(Status::Timeout, 50.0);
+
+        assert_eq!(c.success, 2);
+        assert_eq!(c.client_error, 1);
+        assert_eq!(c.server_error, 1);
+        assert_eq!(c.timeout, 1);
+        assert_eq!(c.total(), 5);
+        // Only Success is "good"; ClientError is bad but not a server failure.
+        assert_eq!(c.good(), 2);
+        assert_eq!(c.server_failures(), 2);
+    }
+
+    #[test]
+    fn record_feeds_latency_digest() {
+        let mut c = Chunk::new(0);
+        for i in 1..=100 {
+            c.record(Status::Success, f64::from(i));
+        }
+        let median = c.latency.quantile(0.5);
+        assert!(
+            (median - 50.0).abs() < 5.0,
+            "expected median ~50, got {median}"
+        );
+    }
+}
