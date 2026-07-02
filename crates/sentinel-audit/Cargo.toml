@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tamper-evident audit log for Sentinel: hash-chained, ed25519-signed, append-only JSONL"
+
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,85 @@
+# Sentinel policy — least privilege for AI agent tool calls.
+#
+# Rules are evaluated top to bottom; FIRST MATCH WINS. Anything that matches
+# no rule gets `default_action`. Keep `deny` as the default: an agent should
+# only be able to do what you explicitly granted.
+version: 1
+default_action: deny
+
+rules:
+  # ── The postmark-mcp lesson ────────────────────────────────────────────
+  # A prompt-injected agent quietly BCCs your mail to an attacker.
+  # Kill the whole vector: agents never get to use BCC.
+  - id: block-bcc
+    description: Never allow BCC on agent-sent email
+    match:
+      server: email
+      tools: ["send_email"]
+      args:
+        - path: bcc
+          exists: true
+    action: deny
+    risk: critical
+    reason: Hidden BCC on agent-sent email is a data-exfiltration vector
+
+  # External recipients need a human in the loop; internal mail flows freely.
+  # (`not_matches` uses any-element semantics: ONE external address among
+  # internal ones still triggers the rule.)
+  - id: approve-external-email
+    match:
+      server: email
+      tools: ["send_email"]
+      args:
+        - path: to
+          not_matches: "^[A-Za-z0-9._%+-]+@example\\.com$"
+    action: approve
+    risk: high
+    reason: Email to an external recipient requires pre-action approval
+
+  - id: allow-internal-email
+    match: { server: email, tools: ["send_email"] }
+    action: allow
+
+  # ── Destructive operations are never agent-callable ───────────────────
+  # Statically-denied tools are also HIDDEN from tools/list, so the agent
+  # never even sees the capability.
+  - id: block-destructive
+    match:
+      tools: ["delete_*", "drop_*", "remove_all_*", "purge_*"]
+    action: deny
+    risk: high
+    reason: Destructive operations require a human at the keyboard
+
+  # ── Spend controls ─────────────────────────────────────────────────────
+  - id: approve-large-charges
+    match:
+      server: payments
+      tools: ["create_charge"]
+      args:
+        - path: amount
+          gt: 100.0
+    action: approve
+    risk: critical
+    reason: Charges over $100 require human approval
+
+  - id: allow-small-charges
+    match: { server: payments, tools: ["create_charge"] }
+    action: allow
+    risk: medium
+
+  # ── Read-only operations are fine everywhere ───────────────────────────
+  - id: allow-reads
+    match:
+      tools: ["get_*", "list_*", "search_*", "read_*", "fetch_*"]
+    action: allow
+    risk: low
+
+  # ── Scope by principal ──────────────────────────────────────────────────
+  # Only ops engineers' agent sessions may touch infra tools at all.
+  - id: infra-ops-only
+    match:
+      server: infra
+      principals: ["*@ops.example.com"]
+    action: allow
+
+# Everything else: default_action: deny.

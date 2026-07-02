@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/sentinel-core",
     "crates/sentinel-cli",
+    "crates/sentinel-policy",
+    "crates/sentinel-audit",
+    "crates/sentinel-gateway",
 ]
 
 [workspace.package]
@@ -53,6 +56,13 @@ rand_distr = "0.4"
 # error handling
 thiserror = "1"
 anyhow = "1"
+
+# crypto / policy (agent-governance gateway)
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+regex = "1"
+tempfile = "3"
 
 # time
 hdrhistogram = "7"

@@ -1,0 +1,42 @@
+# Sentinel gateway configuration.
+#
+# Point your MCP client (Claude Code, Cursor, ...) at the gateway instead of
+# the real server:
+#
+#   sentinel-gateway wrap --config gateway.yaml -- npx @yourorg/email-mcp-server
+#
+# Relative paths resolve against this file's directory.
+
+server:
+  # Logical name used by policy `match.server`. Set per wrapped server.
+  name: email
+
+identity:
+  # Who this agent session acts for. Recorded on every audit entry and
+  # matchable in policy (`match.agents` / `match.principals`).
+  agent: claude-code
+  principal: you@example.com
+
+policy:
+  path: gateway-policy.example.yaml
+
+audit:
+  # Append-only, hash-chained, ed25519-signed JSONL.
+  path: sentinel-audit.jsonl
+  # Create with: sentinel-gateway keygen --key sentinel-audit.key
+  key_path: sentinel-audit.key
+  # Data minimization: omit | hash (default) | full.
+  # `hash` proves what was sent without storing the content.
+  log_args: hash
+
+approvals:
+  # Slack incoming webhook — or any endpoint accepting {"text": "..."}.
+  # Omit the whole `approvals` block to make `action: approve` fail closed.
+  # webhook_url: https://hooks.slack.com/services/T000/B000/XXXX
+  timeout_secs: 300
+  # Include an argument preview in notifications (off = metadata only).
+  include_args: false
+
+control:
+  # Loopback API used by `sentinel-gateway approvals list|approve|deny`.
+  listen: 127.0.0.1:9944

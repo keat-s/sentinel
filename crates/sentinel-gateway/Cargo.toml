@@ -1,0 +1,42 @@
+[package]
+name = "sentinel-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP governance gateway: least-privilege policy enforcement, human-in-the-loop approvals, signed audit log"
+
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[[bin]]
+name = "sentinel-gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-email-mcp"
+path = "src/bin/mock_email_mcp.rs"
+
+[dependencies]
+sentinel-policy = { path = "../sentinel-policy" }
+sentinel-audit = { path = "../sentinel-audit" }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

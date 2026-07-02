@@ -1,5 +1,22 @@
 # Sentinel
 
+Rust infrastructure for running AI systems you can trust in production.
+This workspace ships two components:
+
+1. **[Sentinel Gateway](docs/agent-governance.md) — the trust layer for AI
+   agents.** A governance proxy between any MCP client and its servers:
+   least-privilege policy-as-code on every tool call, human-in-the-loop
+   approval for high-risk actions (Slack webhook + CLI), and a
+   cryptographically signed, tamper-evident audit log. Self-hostable, fails
+   closed, deterministic hot path. See it block a prompt-injected email
+   exfiltration: `./examples/gateway-demo.sh` — full docs in
+   [docs/agent-governance.md](docs/agent-governance.md).
+
+2. **Sentinel Observability — an embeddable observability engine for ML
+   inference services.** The rest of this README covers it.
+
+---
+
 **An embeddable observability engine for ML inference services — written in Rust.**
 
 Sentinel ingests OpenTelemetry-style telemetry from inference services,
@@ -244,14 +261,21 @@ sentinel/
 │   │   │   └── ingest/              # InferenceEvent + Status
 │   │   ├── benches/ingest.rs        # criterion
 │   │   └── tests/end_to_end.rs      # integration
-│   └── sentinel-cli/                # the `sentinel` binary
-│       └── src/commands/
-│           ├── serve.rs             # HTTP API (axum)
-│           ├── simulate.rs          # synthetic traffic + failure injection
-│           ├── query.rs
-│           ├── dashboard.rs         # ratatui TUI
-│           └── bench.rs
-└── examples/sentinel.example.yaml
+│   ├── sentinel-cli/                # the `sentinel` binary
+│   │   └── src/commands/
+│   │       ├── serve.rs             # HTTP API (axum)
+│   │       ├── simulate.rs          # synthetic traffic + failure injection
+│   │       ├── query.rs
+│   │       ├── dashboard.rs         # ratatui TUI
+│   │       └── bench.rs
+│   ├── sentinel-policy/             # agent-governance: policy-as-code engine
+│   ├── sentinel-audit/              # agent-governance: signed hash-chain audit log
+│   └── sentinel-gateway/            # agent-governance: the `sentinel-gateway` MCP proxy
+└── examples/
+    ├── sentinel.example.yaml        # observability engine config
+    ├── gateway.example.yaml         # gateway config
+    ├── gateway-policy.example.yaml  # gateway policy
+    └── gateway-demo.sh              # blocked-exfiltration demo
 ```
 
 ---
