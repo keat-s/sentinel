@@ -6,6 +6,7 @@ members = [
     "crates/sentinel-policy",
     "crates/sentinel-audit",
     "crates/sentinel-gateway",
+    "crates/sentinel-scan",
 ]
 
 [workspace.package]

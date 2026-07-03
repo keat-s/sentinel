@@ -93,6 +93,12 @@ fn summarize(entry: &Entry) -> String {
         Event::ToolsFiltered { hidden, .. } => {
             format!("hid {} denied tool(s): {}", hidden.len(), hidden.join(", "))
         }
+        Event::ProvenanceViolation {
+            kind,
+            subject,
+            enforced,
+            ..
+        } => format!("PROVENANCE {kind} on `{subject}` ({enforced})"),
     };
     format!(
         "#{:<5} {}  {} <- {}/{}",

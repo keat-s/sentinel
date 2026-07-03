@@ -6,10 +6,14 @@ This workspace ships two components:
 1. **[Sentinel Gateway](docs/agent-governance.md) — the trust layer for AI
    agents.** A governance proxy between any MCP client and its servers:
    least-privilege policy-as-code on every tool call, human-in-the-loop
-   approval for high-risk actions (Slack webhook + CLI), and a
-   cryptographically signed, tamper-evident audit log. Self-hostable, fails
-   closed, deterministic hot path. See it block a prompt-injected email
-   exfiltration: `./examples/gateway-demo.sh` — full docs in
+   approval for high-risk actions (Slack webhook + CLI), a cryptographically
+   signed tamper-evident audit log, and provenance pinning that catches MCP
+   "rug pull" tool mutations (`sentinel-gateway pin`). Plus `sentinel-scan`,
+   an MCP security scanner that finds shadow/unpinned/ungoverned servers and
+   prompt-injected tool metadata, and generates a starter policy.
+   Self-hostable, fails closed, deterministic hot path. Demos:
+   `./examples/gateway-demo.sh` (blocked exfiltration),
+   `./examples/scan-demo.sh` (poisoned server caught) — full docs in
    [docs/agent-governance.md](docs/agent-governance.md).
 
 2. **Sentinel Observability — an embeddable observability engine for ML
@@ -270,12 +274,14 @@ sentinel/
 │   │       └── bench.rs
 │   ├── sentinel-policy/             # agent-governance: policy-as-code engine
 │   ├── sentinel-audit/              # agent-governance: signed hash-chain audit log
-│   └── sentinel-gateway/            # agent-governance: the `sentinel-gateway` MCP proxy
+│   ├── sentinel-gateway/            # agent-governance: the `sentinel-gateway` MCP proxy
+│   └── sentinel-scan/               # agent-governance: MCP security scanner
 └── examples/
     ├── sentinel.example.yaml        # observability engine config
     ├── gateway.example.yaml         # gateway config
     ├── gateway-policy.example.yaml  # gateway policy
-    └── gateway-demo.sh              # blocked-exfiltration demo
+    ├── gateway-demo.sh              # blocked-exfiltration demo
+    └── scan-demo.sh                 # scanner + poisoned-server demo
 ```
 
 ---

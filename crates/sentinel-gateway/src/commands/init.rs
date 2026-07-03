@@ -37,6 +37,12 @@ approvals:
 control:
   # Local API used by `sentinel-gateway approvals ...`
   listen: 127.0.0.1:9944
+
+# Provenance pinning — catch "rug pull" server/tool mutations.
+# Create the lockfile once:  sentinel-gateway pin --out server.lock.yaml -- <command>
+# provenance:
+#   lock: server.lock.yaml
+#   enforce: block
 "#;
 
 const POLICY_TEMPLATE: &str = r#"# Sentinel policy — least privilege for AI agent tool calls.

@@ -1,0 +1,33 @@
+[package]
+name = "sentinel-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP security scanner: find shadow, unpinned, and ungoverned MCP servers, probe for prompt-injected tool descriptions, and generate a starter Sentinel policy"
+
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[[bin]]
+name = "sentinel-scan"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-injected-mcp"
+path = "src/bin/mock_injected_mcp.rs"
+
+[dependencies]
+sentinel-policy = { path = "../sentinel-policy" }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -20,6 +20,8 @@ pub struct GatewayConfig {
     pub approvals: Option<ApprovalsCfg>,
     #[serde(default)]
     pub control: ControlCfg,
+    #[serde(default)]
+    pub provenance: Option<ProvenanceCfg>,
 }
 
 /// The wrapped MCP server, as policy sees it.
@@ -96,6 +98,28 @@ fn default_timeout() -> u64 {
     300
 }
 
+/// Provenance pinning: verify the wrapped server against a lockfile
+/// created by `sentinel-gateway pin`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceCfg {
+    /// Lockfile path (from `sentinel-gateway pin`).
+    pub lock: PathBuf,
+    /// What to do on divergence: `block` (default) refuses the executable /
+    /// strips drifted tools and denies calls to them; `warn` records the
+    /// violation in the audit log but lets traffic through.
+    #[serde(default)]
+    pub enforce: EnforceMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforceMode {
+    Warn,
+    #[default]
+    Block,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlCfg {
@@ -120,6 +144,9 @@ impl GatewayConfig {
         cfg.policy.path = absolutize(base, &cfg.policy.path);
         cfg.audit.path = absolutize(base, &cfg.audit.path);
         cfg.audit.key_path = absolutize(base, &cfg.audit.key_path);
+        if let Some(prov) = &mut cfg.provenance {
+            prov.lock = absolutize(base, &prov.lock);
+        }
         Ok(cfg)
     }
 

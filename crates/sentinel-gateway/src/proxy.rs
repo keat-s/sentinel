@@ -19,10 +19,11 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use sentinel_audit::{Actor, ArgsRecord, AuditWriter, Event};
-use sentinel_policy::{CallCtx, Decision, Effect, Policy};
+use sentinel_policy::{CallCtx, Decision, Effect, Policy, Risk};
 
 use crate::approvals::{notify, ApprovalInfo, Broker, Resolution};
-use crate::config::GatewayConfig;
+use crate::config::{EnforceMode, GatewayConfig};
+use crate::provenance::{self, LockFile};
 use crate::util::{gen_id, now_ms};
 
 /// Env var: when set, the gateway writes the bound control-API address to
@@ -37,6 +38,11 @@ struct GatewayState {
     control_addr: Option<SocketAddr>,
     /// JSON-RPC ids of in-flight `tools/list` requests (stringified).
     pending_tool_lists: Mutex<HashSet<String>>,
+    /// Provenance lockfile + enforcement mode, when configured.
+    provenance: Option<(LockFile, EnforceMode)>,
+    /// Tools whose definitions drifted from the lockfile (block mode denies
+    /// calls to these even though policy might allow them).
+    drifted: Mutex<HashSet<String>>,
     to_server: mpsc::Sender<String>,
     to_client: mpsc::Sender<String>,
 }
@@ -77,8 +83,44 @@ pub async fn run(cfg: GatewayConfig, command: Vec<String>) -> anyhow::Result<()>
             cfg.audit.key_path.display()
         )
     })?;
-    let audit = AuditWriter::open(&cfg.audit.path, key)
+    let mut audit = AuditWriter::open(&cfg.audit.path, key)
         .with_context(|| format!("opening audit log {}", cfg.audit.path.display()))?;
+
+    // Provenance: verify the executable BEFORE we run it.
+    let actor = Actor {
+        agent: cfg.identity.agent.clone(),
+        principal: cfg.identity.principal.clone(),
+    };
+    let provenance = match &cfg.provenance {
+        Some(pcfg) => {
+            let lock = LockFile::load(&pcfg.lock)?;
+            if let Err(detail) = provenance::verify_executable(&lock, &command) {
+                let blocked = pcfg.enforce == EnforceMode::Block;
+                let _ = audit.append(
+                    actor.clone(),
+                    Event::ProvenanceViolation {
+                        server: cfg.server.name.clone(),
+                        kind: "executable_mismatch".to_string(),
+                        subject: command[0].clone(),
+                        detail: detail.clone(),
+                        enforced: if blocked { "blocked" } else { "warned" }.to_string(),
+                    },
+                );
+                if blocked {
+                    anyhow::bail!(
+                        "PROVENANCE VIOLATION: {detail}\n\
+                         Refusing to start the MCP server. If this change was deliberate, re-pin:\n\
+                         sentinel-gateway pin --out {} -- {}",
+                        pcfg.lock.display(),
+                        command.join(" ")
+                    );
+                }
+                tracing::warn!("PROVENANCE VIOLATION (warn mode): {detail}");
+            }
+            Some((lock, pcfg.enforce))
+        }
+        None => None,
+    };
 
     // Approvals control plane.
     let broker = Arc::new(Broker::new());
@@ -115,6 +157,8 @@ pub async fn run(cfg: GatewayConfig, command: Vec<String>) -> anyhow::Result<()>
         broker,
         control_addr,
         pending_tool_lists: Mutex::new(HashSet::new()),
+        provenance,
+        drifted: Mutex::new(HashSet::new()),
         to_server,
         to_client,
     });
@@ -226,7 +270,8 @@ async fn handle_server_line(state: &Arc<GatewayState>, line: String) {
         let _ = state.to_client.send(line).await;
         return;
     };
-    // Response to a tracked tools/list? Filter statically-denied tools.
+    // Response to a tracked tools/list? Verify provenance, then filter
+    // statically-denied tools.
     let is_tracked_list = msg
         .get("id")
         .map(|id| state.pending_tool_lists.lock().remove(&id_key(id)))
@@ -236,6 +281,8 @@ async fn handle_server_line(state: &Arc<GatewayState>, line: String) {
             .pointer_mut("/result/tools")
             .and_then(Value::as_array_mut)
         {
+            enforce_tool_provenance(state, tools);
+
             let mut hidden = Vec::new();
             tools.retain(|tool| {
                 let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
@@ -256,12 +303,64 @@ async fn handle_server_line(state: &Arc<GatewayState>, line: String) {
                     server: state.cfg.server.name.clone(),
                     hidden,
                 });
-                let _ = state.to_client.send(msg.to_string()).await;
-                return;
             }
+            let _ = state.to_client.send(msg.to_string()).await;
+            return;
         }
     }
     let _ = state.to_client.send(line).await;
+}
+
+/// Check a live tool list against the provenance lockfile. In block mode,
+/// drifted/added tools are stripped from the list and recorded so calls to
+/// them are denied.
+fn enforce_tool_provenance(state: &Arc<GatewayState>, tools: &mut Vec<Value>) {
+    let Some((lock, mode)) = &state.provenance else {
+        return;
+    };
+    let violations = provenance::verify_tools(lock, tools);
+    if violations.is_empty() {
+        return;
+    }
+    let blocked = *mode == EnforceMode::Block;
+    for v in &violations {
+        tracing::warn!(
+            "PROVENANCE VIOLATION: tool `{}` {} ({})",
+            v.name,
+            v.kind.trim_start_matches("tool_"),
+            if blocked { "blocking" } else { "warn only" }
+        );
+        state.audit(Event::ProvenanceViolation {
+            server: state.cfg.server.name.clone(),
+            kind: v.kind.to_string(),
+            subject: v.name.clone(),
+            detail: format!(
+                "tool `{}` diverged from the pinned surface in {}: {}",
+                v.name,
+                lock.executable.path,
+                v.kind
+            ),
+            enforced: if blocked { "blocked" } else { "warned" }.to_string(),
+        });
+    }
+    if !blocked {
+        return;
+    }
+    let bad: HashSet<&str> = violations
+        .iter()
+        .filter(|v| v.kind != "tool_removed")
+        .map(|v| v.name.as_str())
+        .collect();
+    {
+        let mut drifted = state.drifted.lock();
+        for name in &bad {
+            drifted.insert(name.to_string());
+        }
+    }
+    tools.retain(|t| {
+        let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+        !bad.contains(name)
+    });
 }
 
 async fn handle_tool_call(state: &Arc<GatewayState>, msg: Value, raw_line: String) {
@@ -276,6 +375,39 @@ async fn handle_tool_call(state: &Arc<GatewayState>, msg: Value, raw_line: Strin
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // A tool whose definition drifted from its pinned provenance is denied
+    // outright (block mode) — a poisoned description means the arguments the
+    // model produced can't be trusted either.
+    if matches!(state.provenance, Some((_, EnforceMode::Block)))
+        && state.drifted.lock().contains(&tool)
+    {
+        let decision = Decision {
+            effect: Effect::Deny,
+            rule_id: "<provenance>".to_string(),
+            risk: Some(Risk::Critical),
+            reason: Some(
+                "tool definition drifted from its pinned provenance record; re-pin after a deliberate upgrade"
+                    .to_string(),
+            ),
+        };
+        state.audit(Event::ToolCallEvaluated {
+            server: state.cfg.server.name.clone(),
+            tool: tool.clone(),
+            request_id: request_id.clone(),
+            decision: decision.effect.as_str().to_string(),
+            rule_id: decision.rule_id.clone(),
+            risk: decision.risk.map(|r| r.as_str().to_string()),
+            reason: decision.reason.clone(),
+            args: ArgsRecord::capture(state.cfg.audit.log_args, &args),
+        });
+        tracing::warn!("DENY {tool} (provenance drift)");
+        let _ = state
+            .to_client
+            .send(deny_response(&id, &decision, "blocked by provenance enforcement"))
+            .await;
+        return;
+    }
 
     let mut decision = state.policy.evaluate(&CallCtx {
         server: &state.cfg.server.name,

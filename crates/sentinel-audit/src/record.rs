@@ -130,6 +130,19 @@ pub enum Event {
         /// Names of the hidden tools.
         hidden: Vec<String>,
     },
+    /// The wrapped server diverged from its pinned provenance record.
+    ProvenanceViolation {
+        /// Logical server name.
+        server: String,
+        /// `executable_mismatch` / `tool_changed` / `tool_added` / `tool_removed`.
+        kind: String,
+        /// What diverged (executable path or tool name).
+        subject: String,
+        /// Human-readable detail.
+        detail: String,
+        /// `blocked` or `warned`, per the configured enforcement mode.
+        enforced: String,
+    },
 }
 
 /// The signed unit: one event plus attribution and ordering metadata.

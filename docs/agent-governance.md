@@ -211,6 +211,82 @@ the arguments — enough to prove what was sent (you can re-derive the hash
 from a claimed payload) without storing content. `full` and `omit` are
 opt-in. Self-hosting means none of this ever leaves your infrastructure.
 
+## Provenance pinning & drift detection
+
+The MCP supply chain has a signature attack: the **rug pull**. A server you
+installed clean ships an update (or a compromised registry release) that
+quietly rewrites a tool description to carry injected instructions — and the
+agent ingests tool descriptions as trusted context. Policy alone can't catch
+this: the tool name and arguments look identical.
+
+Pin the server once, then let the gateway enforce it:
+
+```bash
+# Launch the server once in a controlled handshake; record the SHA-256 of
+# the resolved executable and a digest of every tool definition.
+sentinel-gateway pin --out server.lock.yaml -- npx my-mcp-server@1.4.2
+```
+
+```yaml
+# gateway config
+provenance:
+  lock: server.lock.yaml
+  enforce: block   # or `warn`
+```
+
+At `wrap` time the gateway verifies the executable hash **before running
+it** — in `block` mode a swapped binary means the gateway refuses to start.
+At runtime, every `tools/list` response is checked against the pinned
+per-tool digests (name + description + schema, canonical JSON):
+
+- **`block`**: drifted or newly-added tools are stripped from the list the
+  agent sees, and direct calls to them are denied — even if policy would
+  allow the tool. The violation and the denial are both audit entries.
+- **`warn`**: traffic flows, but every divergence is on the signed record.
+
+After a *deliberate* upgrade, review the new surface and re-pin.
+
+Honest limitation: pinning `npx`/`uvx` hashes the launcher, not the package
+it fetches — for those, the tool-surface digests are the meaningful pin
+(and version-pin the package itself; `sentinel-scan` flags unpinned specs).
+Package-level pinning is on the roadmap.
+
+## MCP security scanner (`sentinel-scan`)
+
+A standalone CLI that answers "what can agents on this machine actually
+reach?" — and doubles as the on-ramp to governing it.
+
+```bash
+cargo build --release -p sentinel-scan
+
+# Static scan: find MCP configs (Claude Code, Claude Desktop, Cursor,
+# VS Code), flag the classic misconfigurations. Nothing is executed.
+sentinel-scan .              # walk a directory
+sentinel-scan . --home       # also check ~/.cursor, Claude Desktop, ...
+
+# Live probe: launch each stdio server, fetch its tool surface, and analyze
+# what the agent would ingest. EXECUTES the configured commands — opt-in.
+sentinel-scan . --probe --emit-policy starter-policy.yaml
+
+# CI: exit non-zero at or above a severity
+sentinel-scan . --format json --fail-on high
+```
+
+Static checks: **SENTINEL-001** ungoverned server (not wrapped by
+sentinel-gateway) · **002** unpinned package (`npx pkg` with no version,
+`:latest` images) · **003** remote endpoint over plaintext HTTP · **004**
+server launched via a shell · **005** inline secrets in config env ·
+**006** duplicate server names across configs (shadowing).
+
+Probe checks: **SENTINEL-101** prompt-injection phrases in tool metadata
+(descriptions *and* schema strings) · **102** invisible/bidi characters
+hiding payloads from human review · **103/104** destructive and
+outward-facing tool surfaces · **105** oversized tool surface.
+
+`--emit-policy` turns the observed tool surface into a real, loadable
+starter policy: destructive tools denied, outward-facing tools routed to
+approval, reads allowed, default deny. Demo: `./examples/scan-demo.sh`.
+
 ## Security model & current limitations
 
 What the gateway defends against today:
@@ -220,6 +296,9 @@ What the gateway defends against today:
   refused before it reaches the server.
 - **Shadow capabilities** — statically denied tools are invisible to the
   agent.
+- **Supply-chain rug pulls** — a pinned server that swaps its executable or
+  mutates its tool definitions is blocked (or at minimum recorded), per the
+  provenance section above.
 - **After-the-fact log doctoring** — the signed hash chain makes silent
   edits detectable by anyone with the public key.
 
@@ -239,10 +318,13 @@ What it does not (yet) defend against — be honest with yourself about these:
 
 ## Roadmap
 
+- ~~MCP server provenance/attestation: pin and verify what you're wrapping~~
+  — shipped (`sentinel-gateway pin` + `provenance:` enforcement above).
+- ~~MCP security scanner~~ — shipped (`sentinel-scan`).
 - HTTP/SSE MCP transport; one gateway fronting many servers.
+- Package-level pinning for `npx`/`uvx`-launched servers (registry
+  integrity, not just launcher hash + tool surface).
 - OIDC-derived principals (Entra ID / Okta) instead of static config.
-- MCP server provenance/attestation: pin and verify what you're wrapping
-  (supply-chain trust for the MCP ecosystem).
 - Managed control plane: centralized policy, cross-fleet audit dashboard,
   agent inventory, SSO/SCIM.
 - External chain-head anchoring, OTEL export, retention controls.
@@ -253,4 +335,5 @@ What it does not (yet) defend against — be honest with yourself about these:
 |---|---|
 | `sentinel-policy` | Policy schema, validation, deterministic evaluator |
 | `sentinel-audit` | Signed hash-chain writer/verifier, key management |
-| `sentinel-gateway` | The `sentinel-gateway` binary: MCP proxy, approvals broker, control API, CLI (`wrap`, `init`, `keygen`, `policy`, `audit`, `approvals`) + `mock-email-mcp` demo server |
+| `sentinel-gateway` | The `sentinel-gateway` binary: MCP proxy, approvals broker, control API, provenance pin/enforce, CLI (`wrap`, `init`, `keygen`, `pin`, `policy`, `audit`, `approvals`) + `mock-email-mcp` demo server |
+| `sentinel-scan` | The `sentinel-scan` binary: MCP config scanner + live tool-surface probe + starter-policy generator, with `mock-injected-mcp` as the adversarial fixture |
